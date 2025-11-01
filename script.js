@@ -1,341 +1,337 @@
-/* =============================
-   Rainy-Night Dashboard (Vanilla JS)
-   — ambient visuals + procedural rain audio + live weather + quotes/snippets
-   ============================= */
+import { AmbientAudio, describeMoodAudio } from './audio.js';
+import { RainField, applyMoodVisuals, updateGradientForTime, showQuote, setFooterMoodCopy, setNickname, flashWeatherStatus, updateWeatherUI } from './ui.js';
+import { storage, getCustomQuotes, setCustomQuotes, getSnippets, setSnippets, getIncludeSnippets, setIncludeSnippets } from './storage.js';
+import { fetchWeatherByCity, fetchWeatherByCoords, summariseWeather, DEFAULT_CITY, moodFromCondition } from './weather.js';
 
-// ---------- CONFIG ----------
-const OPENWEATHER_API_KEY = "YOUR_OPENWEATHER_API_KEY_HERE"; // <-- add your key
-const DEFAULT_CITY = "Christchurch"; // gentle NZ default for you :)
+console.log('🌧 Keep calm and code on.');
 
-// ---------- DOM ----------
-const canvas = document.getElementById('rain-canvas');
-const ctx = canvas.getContext('2d');
-const moodBtn = document.getElementById('moodBtn');
-const moodLabel = document.getElementById('moodLabel');
-const audioBtn = document.getElementById('audioBtn');
-const audioIcon = document.getElementById('audioIcon');
-const audioLabel = document.getElementById('audioLabel');
+document.body.classList.add('loaded');
+const container = document.querySelector('.container');
+requestAnimationFrame(() => container?.classList.add('ready'));
+
 const clockEl = document.getElementById('clock');
-
-const cityEl = document.getElementById('city');
-const condEl = document.getElementById('cond');
-const tempEl = document.getElementById('temp');
-const descEl = document.getElementById('desc');
-
 const cityInput = document.getElementById('cityInput');
 const fetchBtn = document.getElementById('fetchBtn');
 const geoBtn = document.getElementById('geoBtn');
-
-const quoteEl = document.getElementById('quote');
-const quoteMeta = document.getElementById('quoteMeta');
-const prevQuote = document.getElementById('prevQuote');
-const nextQuote = document.getElementById('nextQuote');
-
-const snippetEl = document.getElementById('snippet');
-const snippetInput = document.getElementById('snippetInput');
-const saveSnippetBtn = document.getElementById('saveSnippet');
-const includeSnippets = document.getElementById('includeSnippets');
+const audioBtn = document.getElementById('audioBtn');
+const audioIcon = document.getElementById('audioIcon');
+const audioLabel = document.getElementById('audioLabel');
+const moodButtons = Array.from(document.querySelectorAll('.mood-btn'));
+const nicknameInput = document.getElementById('nicknameInput');
+const saveNicknameBtn = document.getElementById('saveNickname');
+const includeSnippetsToggle = document.getElementById('includeSnippets');
+const prevQuoteBtn = document.getElementById('prevQuote');
+const nextQuoteBtn = document.getElementById('nextQuote');
+const refreshQuotesBtn = document.getElementById('refreshQuotes');
 const addCustomBtn = document.getElementById('addCustom');
 const customInput = document.getElementById('customInput');
+const languageSelect = document.getElementById('languageSelect');
+const saveSnippetBtn = document.getElementById('saveSnippet');
+const clearSnippetBtn = document.getElementById('clearSnippet');
 
-// ---------- CLOCK ----------
-function updateClock(){
+let currentMood = storage.mood || 'rain';
+let weatherSuggestsRain = true;
+let userInteractedMood = false;
+
+const rainField = new RainField(document.getElementById('rain-canvas'));
+const ambientAudio = new AmbientAudio(onAudioStateChange);
+
+const MOOD_INTENSITY = {
+  rain: 1,
+  storm: 1.4,
+  snow: 0.6,
+  sunny: 0.2,
+};
+
+function onAudioStateChange(enabled) {
+  if (enabled) {
+    audioBtn.setAttribute('aria-pressed', 'true');
+    audioIcon.textContent = '🔊';
+    audioLabel.textContent = 'Sound On';
+  } else {
+    audioBtn.setAttribute('aria-pressed', 'false');
+    audioIcon.textContent = '🔇';
+    audioLabel.textContent = 'Sound Off';
+  }
+}
+
+function updateClock() {
   const now = new Date();
-  const opts = {hour:'2-digit', minute:'2-digit'};
-  clockEl.textContent = now.toLocaleTimeString([], opts);
+  clockEl.textContent = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  updateGradientForTime(currentMood, now);
 }
-setInterval(updateClock, 1000); updateClock();
+setInterval(updateClock, 60 * 1000);
+updateClock();
 
-// ---------- MOOD ----------
-const MOODS = ['Rain','Calm','Night','Clear'];
-let moodIndex = 0;
-function setMood(idx){
-  moodIndex = (idx+MOODS.length)%MOODS.length;
-  moodLabel.textContent = MOODS[moodIndex];
-  document.documentElement.style.setProperty('--accent', ['#FFCFA3','#CFFFB0','#B8C7FF','#FFD28D'][moodIndex]);
-  document.documentElement.style.setProperty('--accent-2', ['#8DA9C4','#98B2A6','#9AA6E0','#7EC8E3'][moodIndex]);
+function setMood(mood, { fromWeather = false } = {}) {
+  if (!['rain', 'storm', 'snow', 'sunny'].includes(mood)) mood = 'rain';
+  currentMood = mood;
+  applyMoodVisuals(mood);
+  updateGradientForTime(mood);
+  ambientAudio.setMood(mood);
+  setFooterMoodCopy(`${mood.charAt(0).toUpperCase() + mood.slice(1)} mood • ${describeMoodAudio(mood)}`);
+
+  moodButtons.forEach((btn) => {
+    btn.classList.toggle('active', btn.dataset.mood === mood);
+  });
+
+  if (!fromWeather) {
+    storage.mood = mood;
+    userInteractedMood = true;
+  }
+
+  const rainActive = weatherSuggestsRain || mood !== 'sunny';
+  rainField.setActive(rainActive);
+  const intensity = weatherSuggestsRain ? Math.max(1, MOOD_INTENSITY[mood]) : MOOD_INTENSITY[mood];
+  rainField.setIntensity(intensity);
 }
-moodBtn.addEventListener('click', ()=> setMood(moodIndex+1));
-setMood(0);
 
-// ---------- CANVAS RAIN ----------
-let W = 0, H = 0, drops = [], raining = true;
-function resize(){
-  W = canvas.width = window.innerWidth;
-  H = canvas.height = window.innerHeight;
-}
-window.addEventListener('resize', resize); resize();
+moodButtons.forEach((btn) => {
+  btn.addEventListener('click', () => {
+    const mood = btn.dataset.mood;
+    setMood(mood);
+  });
+});
 
-function makeDrops(count){
-  drops = [];
-  for(let i=0;i<count;i++){
-    drops.push({
-      x: Math.random()*W,
-      y: Math.random()*H,
-      len: 10 + Math.random()*20,
-      spd: 0.5 + Math.random()*1.5,
-      thick: 0.6 + Math.random()*1.1,
-      alpha: 0.2 + Math.random()*0.3
-    });
+function handleWeather(data) {
+  const summary = summariseWeather(data);
+  updateWeatherUI(summary);
+  const isRaining = /rain|drizzle|thunderstorm/.test(summary.condition);
+  weatherSuggestsRain = isRaining;
+  const suggestedMood = moodFromCondition(summary.condition);
+  if (!userInteractedMood) {
+    setMood(suggestedMood, { fromWeather: true });
+  } else {
+    setMood(currentMood, { fromWeather: true });
   }
 }
-makeDrops(240);
 
-function render(){
-  ctx.clearRect(0,0,W,H);
-  if(raining){
-    ctx.strokeStyle = 'rgba(200,220,255,0.6)';
-    ctx.lineCap = 'round';
-    for(const d of drops){
-      ctx.globalAlpha = d.alpha;
-      ctx.lineWidth = d.thick;
-      ctx.beginPath();
-      ctx.moveTo(d.x, d.y);
-      ctx.lineTo(d.x+0.6*d.len, d.y+d.len);
-      ctx.stroke();
+async function getWeatherByCity(city) {
+  try {
+    const data = await fetchWeatherByCity(city);
+    handleWeather(data);
+  } catch (err) {
+    flashWeatherStatus(err.message || 'Weather unavailable.');
+  }
+}
 
-      d.x += 0.2*d.spd; d.y += 3.2*d.spd;
-      if(d.y > H+20){ d.y = -20; d.x = Math.random()*W; }
+async function getWeatherByLocation() {
+  if (!navigator.geolocation) {
+    alert('Geolocation is not supported in this browser.');
+    return;
+  }
+  navigator.geolocation.getCurrentPosition(async (position) => {
+    try {
+      const data = await fetchWeatherByCoords(position.coords.latitude, position.coords.longitude);
+      handleWeather(data);
+      if (data?.name) {
+        cityInput.value = data.name;
+        storage.city = data.name;
+      }
+    } catch (err) {
+      flashWeatherStatus(err.message || 'Weather unavailable.');
     }
-    ctx.globalAlpha = 1;
-  }
-  requestAnimationFrame(render);
-}
-render();
-
-// ---------- PROCEDURAL RAIN AUDIO (Web Audio API) ----------
-let audioCtx, gainNode, filterNode, noiseNode;
-let audioEnabled = false;
-
-function createRain(){
-  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-  // Pink-ish noise buffer
-  const bufferSize = 2 * audioCtx.sampleRate;
-  const noiseBuffer = audioCtx.createBuffer(1, bufferSize, audioCtx.sampleRate);
-  const out = noiseBuffer.getChannelData(0);
-
-  // Voss-McCartney style pink-ish noise approximation
-  let b0=0,b1=0,b2=0,b3=0,b4=0,b5=0,b6=0;
-  for (let i=0; i<bufferSize; i++) {
-    const white = Math.random()*2-1;
-    b0 = 0.99886*b0 + white*0.0555179;
-    b1 = 0.99332*b1 + white*0.0750759;
-    b2 = 0.96900*b2 + white*0.1538520;
-    b3 = 0.86650*b3 + white*0.3104856;
-    b4 = 0.55000*b4 + white*0.5329522;
-    b5 = -0.7616*b5 - white*0.0168980;
-    const pink = b0+b1+b2+b3+b4+b5+b6 + white*0.5362;
-    b6 = white*0.115926;
-    out[i] = pink*0.09; // base amplitude
-  }
-
-  noiseNode = audioCtx.createBufferSource();
-  noiseNode.buffer = noiseBuffer;
-  noiseNode.loop = true;
-
-  filterNode = audioCtx.createBiquadFilter();
-  filterNode.type = 'lowpass';
-  filterNode.frequency.value = 2200; // soft rain
-  filterNode.Q.value = 0.0001;
-
-  gainNode = audioCtx.createGain();
-  gainNode.gain.value = 0.28; // gentle volume
-
-  noiseNode.connect(filterNode).connect(gainNode).connect(audioCtx.destination);
+  }, () => {
+    alert('Location permission denied.');
+  });
 }
 
-async function enableAudio(){
-  if(!audioCtx){ createRain(); }
-  if(audioCtx.state === 'suspended') await audioCtx.resume();
-  noiseNode.start(0);
-  audioEnabled = true;
-  audioBtn.setAttribute('aria-pressed','true');
-  audioIcon.textContent = '🔊';
-  audioLabel.textContent = 'Sound On';
-}
-
-async function disableAudio(){
-  if(!audioCtx) return;
-  try{ noiseNode.stop(); }catch{}
-  audioEnabled = false;
-  audioBtn.setAttribute('aria-pressed','false');
-  audioIcon.textContent = '🔇';
-  audioLabel.textContent = 'Sound Off';
-  // Recreate on next start (BufferSource can’t be restarted)
-  noiseNode.disconnect();
-  createRain();
-}
-
-audioBtn.addEventListener('click', ()=>{
-  if(audioEnabled) disableAudio(); else enableAudio();
-  localStorage.setItem('ambientAudio', audioEnabled ? 'on' : 'off');
-});
-
-// ---------- WEATHER ----------
-async function fetchWeatherByCity(city){
-  if(!OPENWEATHER_API_KEY || OPENWEATHER_API_KEY.includes('YOUR_')){
-    descEl.textContent = 'Add your OPENWEATHER_API_KEY in script.js';
-    return;
-  }
-  const url = `https://api.openweathermap.org/data/2.5/weather?q=${encodeURIComponent(city)}&appid=${OPENWEATHER_API_KEY}&units=metric`;
-  const res = await fetch(url);
-  if(!res.ok){ throw new Error('Weather fetch failed'); }
-  return res.json();
-}
-
-async function fetchWeatherByCoords(lat, lon){
-  if(!OPENWEATHER_API_KEY || OPENWEATHER_API_KEY.includes('YOUR_')){
-    descEl.textContent = 'Add your OPENWEATHER_API_KEY in script.js';
-    return;
-  }
-  const url = `https://api.openweathermap.org/data/2.5/weather?lat=${lat}&lon=${lon}&appid=${OPENWEATHER_API_KEY}&units=metric`;
-  const res = await fetch(url);
-  if(!res.ok){ throw new Error('Weather fetch failed'); }
-  return res.json();
-}
-
-function applyWeather(data){
-  if(!data) return;
-  const name = data.name;
-  const temp = Math.round(data.main?.temp ?? 0);
-  const cond = (data.weather?.[0]?.main || '').toLowerCase();
-  const desc = data.weather?.[0]?.description || '';
-
-  cityEl.textContent = name || '—';
-  tempEl.textContent = isFinite(temp) ? temp : '--';
-  condEl.textContent = cond || '—';
-  descEl.textContent = desc;
-
-  const rainingNow = /rain|drizzle|thunderstorm/.test(cond);
-  setRaining(rainingNow);
-  if(rainingNow){
-    // gentle bump in volume + denser drops
-    if(audioEnabled){ gainNode.gain.linearRampToValueAtTime(0.35, audioCtx.currentTime+1); }
-    makeDrops(320);
-  }else{
-    if(audioEnabled){ gainNode.gain.linearRampToValueAtTime(0.22, audioCtx.currentTime+1); }
-    makeDrops(180);
-  }
-}
-
-function setRaining(is){
-  raining = is;
-  document.getElementById('mist').style.opacity = is ? 0.25 : 0.35;
-}
-
-fetchBtn.addEventListener('click', async ()=>{
+fetchBtn?.addEventListener('click', () => {
   const city = cityInput.value.trim() || DEFAULT_CITY;
-  localStorage.setItem('city', city);
-  try{ const data = await fetchWeatherByCity(city); applyWeather(data); }
-  catch{ descEl.textContent = 'Could not get weather (city)'; }
+  storage.city = city;
+  getWeatherByCity(city);
 });
 
-geoBtn.addEventListener('click', ()=>{
-  if(!navigator.geolocation){ alert('Geolocation not supported'); return; }
-  navigator.geolocation.getCurrentPosition(async (pos)=>{
-    try{
-      const data = await fetchWeatherByCoords(pos.coords.latitude, pos.coords.longitude);
-      applyWeather(data);
-      localStorage.setItem('city', data?.name || '');
-      cityInput.value = data?.name || '';
-    }catch{ descEl.textContent = 'Could not get weather (location)'; }
-  }, ()=> alert('Location permission denied'));
+geoBtn?.addEventListener('click', () => {
+  getWeatherByLocation();
 });
 
-// ---------- QUOTES / AFFIRMATIONS / SNIPPETS ----------
+audioBtn?.addEventListener('click', async () => {
+  if (ambientAudio.enabled) {
+    ambientAudio.disable();
+    storage.audio = 'off';
+  } else {
+    const started = await ambientAudio.enable();
+    if (started) {
+      storage.audio = 'on';
+    }
+  }
+});
+
 const baseQuotes = [
-  { text: "Simplicity is the soul of efficiency.", by: "Austin Freeman" },
-  { text: "Code is like poetry—readable and meaningful.", by: "Unknown" },
-  { text: "Small steps nightly beat big sprints rarely.", by: "Calm Coder" },
-  { text: "// Remember: you’re learning, and that’s enough.", by: "You" },
-  { text: "Make it work, make it right, make it fast.", by: "Kent Beck" },
-  { text: "Delete code bravely; clarity loves space.", by: "Calm Coder" },
+  { text: 'Simplicity is the soul of efficiency.', by: 'Austin Freeman' },
+  { text: 'Code is like poetry—readable and meaningful.', by: 'Unknown' },
+  { text: 'Small steps nightly beat big sprints rarely.', by: 'Calm Coder' },
+  { text: '// Remember: you’re learning, and that’s enough.', by: 'You' },
+  { text: 'Make it work, make it right, make it fast.', by: 'Kent Beck' },
+  { text: 'Delete code bravely; clarity loves space.', by: 'Calm Coder' },
+  { text: 'Refactor the mind before the code.', by: 'Night Owl' },
+  { text: 'Debug patiently. Celebrate quietly. Repeat.', by: 'Rainy Night' },
 ];
 
-function getCustomQuotes(){ return JSON.parse(localStorage.getItem('customQuotes')||'[]'); }
-function setCustomQuotes(arr){ localStorage.setItem('customQuotes', JSON.stringify(arr)); }
-function getProudSnippets(){ return JSON.parse(localStorage.getItem('proudSnippets')||'[]'); }
+let fetchedQuotes = [];
+let rotationItems = [];
+let rotationIndex = 0;
+let rotationTimer;
 
-let allItems = [];
-let idx = 0;
-let rotTimer;
+function buildRotation() {
+  const customs = getCustomQuotes();
+  const snippets = getSnippets();
+  const includeSnippets = includeSnippetsToggle.checked;
+  const snippetItems = includeSnippets
+    ? snippets.map((entry) => ({ text: entry.code, by: `Snippet • ${entry.language.toUpperCase()}` }))
+    : [];
 
-function rebuildRotation(){
-  allItems = [...baseQuotes, ...getCustomQuotes()];
-  if(includeSnippets.checked){
-    const snips = getProudSnippets().map(s => ({text:s, by:"Snippet"}));
-    allItems = [...allItems, ...snips];
+  rotationItems = [...fetchedQuotes, ...baseQuotes, ...customs, ...snippetItems];
+  if (rotationItems.length === 0) {
+    rotationItems = [{ text: 'Add your first calming thought →', by: 'Helper' }];
   }
-  if(allItems.length === 0){
-    allItems = [{text:"Add your first calming thought on the right →", by:"Helper"}];
-  }
-  idx = Math.min(idx, allItems.length-1);
-  showCurrent();
+  rotationIndex = rotationIndex % rotationItems.length;
+  showRotationItem();
+  restartRotationTimer();
 }
 
-function showCurrent(){
-  const item = allItems[idx];
-  quoteEl.textContent = item.text;
-  quoteMeta.textContent = item.by ? `— ${item.by}` : '';
+function showRotationItem() {
+  const item = rotationItems[rotationIndex];
+  showQuote(item.text, item.by);
 }
 
-function next(){ idx = (idx+1)%allItems.length; showCurrent(); }
-function prev(){ idx = (idx-1+allItems.length)%allItems.length; showCurrent(); }
-
-prevQuote.addEventListener('click', prev);
-nextQuote.addEventListener('click', next);
-
-function startRotation(){
-  if(rotTimer) clearInterval(rotTimer);
-  rotTimer = setInterval(next, 16000);
+function nextQuote() {
+  rotationIndex = (rotationIndex + 1) % rotationItems.length;
+  showRotationItem();
 }
 
-addCustomBtn.addEventListener('click', ()=>{
-  const t = customInput.value.trim();
-  if(!t) return;
-  const arr = getCustomQuotes();
-  arr.push({text:t, by:"You"});
-  setCustomQuotes(arr);
+function prevQuote() {
+  rotationIndex = (rotationIndex - 1 + rotationItems.length) % rotationItems.length;
+  showRotationItem();
+}
+
+function restartRotationTimer() {
+  clearInterval(rotationTimer);
+  rotationTimer = setInterval(nextQuote, 15000);
+}
+
+prevQuoteBtn?.addEventListener('click', () => {
+  prevQuote();
+  restartRotationTimer();
+});
+
+nextQuoteBtn?.addEventListener('click', () => {
+  nextQuote();
+  restartRotationTimer();
+});
+
+refreshQuotesBtn?.addEventListener('click', async () => {
+  await fetchZenQuotes();
+});
+
+addCustomBtn?.addEventListener('click', () => {
+  const text = customInput.value.trim();
+  if (!text) return;
+  const quotes = getCustomQuotes();
+  quotes.push({ text, by: 'You' });
+  setCustomQuotes(quotes);
   customInput.value = '';
-  rebuildRotation();
+  buildRotation();
 });
 
-saveSnippetBtn.addEventListener('click', ()=>{
-  const s = snippetInput.value.trim();
-  if(!s) return;
-  const arr = getProudSnippets();
-  arr.push(s);
-  localStorage.setItem('proudSnippets', JSON.stringify(arr));
-  snippetEl.textContent = s;
-  snippetInput.value = '';
-  rebuildRotation();
+includeSnippetsToggle?.addEventListener('change', () => {
+  const checked = includeSnippetsToggle.checked;
+  setIncludeSnippets(checked);
+  buildRotation();
 });
 
-includeSnippets.addEventListener('change', ()=>{
-  localStorage.setItem('includeSnippets', includeSnippets.checked ? '1' : '0');
-  rebuildRotation();
+async function fetchZenQuotes() {
+  try {
+    const response = await fetch('https://zenquotes.io/api/quotes');
+    const data = await response.json();
+    if (Array.isArray(data)) {
+      fetchedQuotes = data.slice(0, 30).map((item) => ({ text: item.q, by: item.a }));
+    }
+  } catch (err) {
+    console.warn('Could not fetch ZenQuotes', err);
+    fetchedQuotes = [];
+  }
+  buildRotation();
+}
+
+const defaultSnippet = `// Tonight's tiny win\nconst breathe = (inhale = 4, exhale = 6) => {\n  console.log('inhale…');\n  setTimeout(() => console.log('exhale…'), inhale * 1000);\n};\nbreathe();`;
+
+let editor;
+function initEditor() {
+  const saved = getSnippets();
+  const initial = saved.length ? saved[saved.length - 1].code : defaultSnippet;
+  editor = CodeMirror(document.getElementById('editor'), {
+    value: initial,
+    mode: languageSelect.value,
+    theme: 'material-darker',
+    lineNumbers: true,
+    lineWrapping: true,
+    tabSize: 2,
+    indentUnit: 2,
+    viewportMargin: Infinity,
+  });
+}
+
+initEditor();
+
+languageSelect?.addEventListener('change', () => {
+  editor.setOption('mode', languageSelect.value);
 });
 
-// ---------- INIT ----------
-(async function init(){
-  // restore prefs
-  const savedCity = localStorage.getItem('city') || DEFAULT_CITY;
-  cityInput.value = savedCity;
-  includeSnippets.checked = localStorage.getItem('includeSnippets') === '1';
+saveSnippetBtn?.addEventListener('click', () => {
+  const code = editor.getValue().trim();
+  if (!code) return;
+  const language = languageSelect.value || 'javascript';
+  const snippets = getSnippets();
+  snippets.push({ code, language, savedAt: new Date().toISOString() });
+  setSnippets(snippets.slice(-20));
+  buildRotation();
+});
 
-  const audioPref = localStorage.getItem('ambientAudio') || 'on';
-  if (audioPref === 'on') {
-    try { await enableAudio(); } catch { /* user gesture needed; button will work */ }
+clearSnippetBtn?.addEventListener('click', () => {
+  editor.setValue('');
+  setSnippets([]);
+  buildRotation();
+});
+
+saveNicknameBtn?.addEventListener('click', () => {
+  const name = nicknameInput.value.trim();
+  storage.nickname = name;
+  setNickname(name);
+});
+
+function restoreState() {
+  cityInput.value = storage.city || DEFAULT_CITY;
+  includeSnippetsToggle.checked = getIncludeSnippets();
+  nicknameInput.value = storage.nickname || '';
+  setNickname(storage.nickname || '');
+  setMood(currentMood, { fromWeather: true });
+}
+
+async function init() {
+  restoreState();
+
+  if (storage.audio !== 'off') {
+    ambientAudio.enable().then((started) => {
+      storage.audio = started ? 'on' : 'off';
+    });
   }
 
-  rebuildRotation(); startRotation();
+  await fetchZenQuotes();
+  buildRotation();
 
-  // try weather
-  try{
-    const data = await fetchWeatherByCity(savedCity);
-    applyWeather(data);
-  }catch{
-    descEl.textContent = 'Weather unavailable (city). You can still enjoy the vibes.';
-    setRaining(true);
+  await getWeatherByCity(storage.city || DEFAULT_CITY);
+}
+
+init();
+
+window.addEventListener('focus', () => updateGradientForTime(currentMood));
+
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden && ambientAudio.enabled) {
+    ambientAudio.disable();
+  } else if (!document.hidden && storage.audio !== 'off') {
+    ambientAudio.enable();
   }
-})();
+});
